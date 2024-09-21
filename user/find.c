@@ -9,11 +9,13 @@ void find(char *path, char *target) {
     struct dirent de;
     struct stat st;
 
+    // 尝试打开给定路径
     if((fd = open(path, 0)) < 0){
         fprintf(2, "find: cannot open %s\n", path);
         return;
     }
 
+    // 获取文件/目录的状态信息
     if(fstat(fd, &st) < 0){
         fprintf(2, "find: cannot stat %s\n", path);
         close(fd);
@@ -23,7 +25,7 @@ void find(char *path, char *target) {
     switch(st.type){
     case T_FILE:
     case T_DIR:
-        // Check if the current file or directory matches the target
+        // 检查当前文件或目录是否匹配目标名称
         p = path + strlen(path);
         while(p > path && *p != '/')
             p--;
@@ -33,7 +35,7 @@ void find(char *path, char *target) {
             printf("%s\n", path);
         }
 
-        // If it's a directory, continue searching inside
+        // 如果是目录，则继续在其中搜索
         if(st.type == T_DIR) {
             if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
                 printf("find: path too long\n");
@@ -42,6 +44,7 @@ void find(char *path, char *target) {
             strcpy(buf, path);
             p = buf+strlen(buf);
             *p++ = '/';
+            // 读取目录中的每个条目
             while(read(fd, &de, sizeof(de)) == sizeof(de)){
                 if(de.inum == 0)
                     continue;
@@ -51,9 +54,10 @@ void find(char *path, char *target) {
                     printf("find: cannot stat %s\n", buf);
                     continue;
                 }
+                // 跳过 "." 和 ".." 目录
                 if(strcmp(de.name, ".") == 0 || strcmp(de.name, "..") == 0)
                     continue;
-                find(buf, target); // Recursive search
+                find(buf, target); // 递归搜索
             }
         }
         break;
@@ -63,6 +67,7 @@ void find(char *path, char *target) {
 
 int main(int argc, char *argv[])
 {
+    // 检查命令行参数
     if(argc != 3){
         fprintf(2, "Usage: find <directory> <filename>\n");
         exit(1);
