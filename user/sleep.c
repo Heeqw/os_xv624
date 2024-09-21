@@ -18,5 +18,6 @@ int main(int argc, char *argv[]){
     }
     // 调用系统的 sleep 函数
     sleep(tm);
+    printf("(nothing happens for a little while)\n");
     exit(0);
 }
