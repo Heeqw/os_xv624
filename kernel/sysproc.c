@@ -116,11 +116,25 @@ uint64 sys_sysinfo(void) {
 
 // 统计进程调度信息的系统调用
 uint64 sys_wait_sched(void) {
-    
+    uint64 runnable_time;
+    uint64 running_time;
+    uint64 sleep_time;
+
+    if (argaddr(0,&runnable_time) < 0 ||
+        argaddr(1,&running_time) < 0 ||
+        argaddr(2,&sleep_time) < 0)
+      return -1;
+
+    return wait_sched((int*)runnable_time, (int*)running_time, (int*)sleep_time);
 }
 
 
 // 设置进程优先级的系统调用
 uint64 sys_set_priority(void) {
-    
+    int priority, pid;
+
+    if (argint(0, &priority) < 0 || argint(1, &pid) < 0)
+      return -1;
+
+    return set_priority(priority, pid);
 }

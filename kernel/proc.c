@@ -101,6 +101,13 @@ found:
   p->pid = allocpid();
   
   // TODO: add A LOT OF init here
+  p->created_time = ticks;
+  p->finish_time = 0;
+  p->running_time = 0;
+  p->runable_time = 0;
+  p->sleep_time = 0;
+  p->start = ticks;
+  p->end = 0;
 
   #ifdef PR
   p->priority = 2;
@@ -210,6 +217,7 @@ void userinit(void) {
   p->cwd = namei("/");
 
   // TODO: on state change
+  on_state_change(UNUSED,RUNNABLE,p);
   p->state = RUNNABLE;
 
   release(&p->lock);
@@ -271,6 +279,7 @@ int fork(void) {
   pid = np->pid;
 
   // TODO: on state change
+  on_state_change(UNUSED,RUNNABLE,np);
   np->state = RUNNABLE;
 
   release(&np->lock);
@@ -356,9 +365,11 @@ void exit(int status) {
   wakeup1(original_parent);
 
   // TODO: on state change
-
+  enum procstate old_state = p->state;
   p->xstate = status;
   p->state = ZOMBIE;
+  on_state_change(old_state,ZOMBIE,p);
+  p->finish_time = ticks;
 
   release(&original_parent->lock);
 
@@ -366,6 +377,7 @@ void exit(int status) {
   sched();
   panic("zombie exit");
 }
+
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
@@ -461,12 +473,35 @@ void scheduler(void) {
     }
     #elif defined PR
     // Priority scheduling, iterating over max_p to find process with highest priority
-
+    struct proc *max_p = 0;    
+    int highest_prio = 4;  
     // First find the process with the highest priority and is RUNNABLE
-    
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        if(p->priority < highest_prio) {
+          if(max_p != 0) {
+            release(&max_p->lock);
+          }
+          highest_prio = p->priority;
+          max_p = p;
+          found = 1;
+          continue;
+        }
+      }
+      release(&p->lock);
+    }
     
     // If found such max_p, copy to p, and run it.
-    
+    if (found && max_p != 0){
+      on_state_change(max_p->state, RUNNING, max_p);
+      max_p->state = RUNNING;
+      c->proc = max_p;
+      swtch(&c->context, &max_p->context);
+
+      c->proc = 0;
+      release(&max_p->lock);
+    }
     #endif
     // The same as Round-Robin, if no RUNNABLE process is found, we will wait for interrupt
     if (found == 0) {
@@ -503,7 +538,8 @@ void yield(void) {
   acquire(&p->lock);
 
   // TODO: on state change
-  
+  on_state_change(RUNNING,RUNNABLE,p);
+
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
@@ -545,6 +581,7 @@ void sleep(void *chan, struct spinlock *lk) {
   }
 
   // TODO: on state change
+  on_state_change(RUNNING,SLEEPING,p);
 
   // Go to sleep.
   p->chan = chan;
@@ -571,7 +608,7 @@ void wakeup(void *chan) {
     acquire(&p->lock);
     if (p->state == SLEEPING && p->chan == chan) {
       // TODO: on state change
-
+      on_state_change(SLEEPING,RUNNABLE,p);
       p->state = RUNNABLE;
     }
     release(&p->lock);
@@ -599,7 +636,7 @@ int kill(int pid) {
       p->killed = 1;
       if (p->state == SLEEPING) {
         // TODO: on state change
-
+        on_state_change(SLEEPING,RUNNABLE,p);
         // Wake process from sleep().
         p->state = RUNNABLE;
       }
@@ -673,16 +710,104 @@ uint64 get_unused_procs(void) {
 
 // get the running time, sleeping time, runnable time when the child process returns 
 int wait_sched(int *runable_time, int *running_time, int *sleep_time) {
+  struct proc *np;
+  int havekids, pid;
+  struct proc *p = myproc();
 
+  // hold p->lock for the whole time to avoid lost
+  // wakeups from a child's exit().
+  acquire(&p->lock);
+
+  for (;;) {
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for (np = proc; np < &proc[NPROC]; np++) {
+      // this code uses np->parent without holding np->lock.
+      // acquiring the lock first would cause a deadlock,
+      // since np might be an ancestor, and we already hold p->lock.
+      if (np->parent == p) {
+        // np->parent can't change between the check and the acquire()
+        // because only the parent changes it, and we're the parent.
+        acquire(&np->lock);
+        havekids = 1;
+        if (np->state == ZOMBIE) {
+          // Found one.
+          pid = np->pid;
+          on_state_change(np->state,UNUSED,np);
+
+          if(copyout(p->pagetable, (uint64)runable_time, 
+                    (char *)&np->runable_time, sizeof(int)) < 0 ||
+             copyout(p->pagetable, (uint64)running_time,
+                    (char *)&np->running_time, sizeof(int)) < 0 ||
+             copyout(p->pagetable, (uint64)sleep_time,
+                    (char *)&np->sleep_time, sizeof(int)) < 0) {
+            release(&np->lock);
+            release(&p->lock);
+            return -1;
+          }                 
+          freeproc(np);
+          release(&np->lock);
+          release(&p->lock);
+          return pid;
+        }
+        release(&np->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+
+    // Wait for a child to exit.
+    sleep(p, &p->lock);  // DOC: wait-sleep
+  }
 }
 
 // UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE
 int on_state_change(int cur_state, int nxt_state, struct proc *p) {
-    
+  // Get current ticks as end time for current state
+  p->end = ticks;
+  
+  // Calculate duration in current state
+  uint64 duration = p->end - p->start;
+  
+  // Update time spent in current state
+  switch(cur_state) {
+    case RUNNING:
+      p->running_time += duration;
+      break;
+    case RUNNABLE:
+      p->runable_time += duration;
+      break;
+    case SLEEPING:
+      p->sleep_time += duration;
+      break;
+  }
+  
+  // Set start time for next state
+  p->start = ticks;
+  
+  return 0;
 }
 
 // set priority [0-3] to a given process [pid]
 // -1 means error, 0 means success
 int set_priority(int priority, int pid) {
+    struct proc *p;
+
+    if (priority < 0 || priority > 3)
+      return -1;
     
+    for (p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if (p->pid == pid){
+        p->priority = priority;
+        release(&p->lock);
+        return 0;
+      }
+      release(&p->lock);
+    }
+    return -1;
 }
