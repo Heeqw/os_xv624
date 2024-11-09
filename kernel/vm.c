@@ -172,6 +172,56 @@ pagetable_t uvmcreate() {
   return pagetable;
 }
 
+//part 2
+void 
+kvmmapkern(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if (mappages(pagetable, va, sz, pa, perm) != 0) 
+    panic("kvmmap");
+}
+
+// proc's version of kvminit
+pagetable_t
+kvmcreate() 
+{
+  pagetable_t pagetable;
+  int i;
+
+  pagetable = uvmcreate();
+  for(i = 1; i < 512; i++) {
+    pagetable[i] = kernel_pagetable[i];
+  }
+
+  // uart registers
+  kvmmapkern(pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interface
+  kvmmapkern(pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // CLINT
+  kvmmapkern(pagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // PLIC
+  kvmmapkern(pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  
+  return pagetable;
+}
+
+
+void 
+kvmfree(pagetable_t kpagetale, uint64 sz) 
+{
+  pte_t pte = kpagetale[0];
+  pagetable_t level1 = (pagetable_t) PTE2PA(pte);
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = level1[i];
+    if (pte & PTE_V) {
+      uint64 level2 = PTE2PA(pte);
+      kfree((void *) level2);
+      level1[i] = 0;
+    }
+  }
+  kfree((void *) level1);
+  kfree((void *) kpagetale);
+}
+
 // Load the user initcode into address 0 of pagetable,
 // for the very first process.
 // sz must be less than a page.
@@ -378,4 +428,51 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+void
+vmprint_recursive(pagetable_t pagetable, int level) 
+{
+  // 遍历512个页表项
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V) { // 只处理有效的页表项
+      // 打印缩进
+      for(int j = 0; j < level; j++){
+        printf("||   ");
+      }
+      
+      uint64 child = PTE2PA(pte);
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){ // 非叶节点
+        // 打印页表项信息
+        printf("||idx: %d: pa: %p, flags: ", i, child);
+        
+        // 用字符串方式打印权限标志
+        printf("%s", (pte & PTE_R) ? "r" : "-");
+        printf("%s", (pte & PTE_W) ? "w" : "-"); 
+        printf("%s", (pte & PTE_X) ? "x" : "-");
+        printf("%s\n", (pte & PTE_U) ? "u" : "-");
+        
+        // 递归处理下一级页表
+        vmprint_recursive((pagetable_t)child, level + 1);
+      } else { // 叶节点
+        // 计算虚拟地址
+        uint64 va = (uint64)i << (PXSHIFT(2-level));
+        printf("||idx: %d: va: %p -> pa: %p, flags: ", i, va, child);
+        
+        // 打印权限标志
+        printf("%s", (pte & PTE_R) ? "r" : "-");
+        printf("%s", (pte & PTE_W) ? "w" : "-");
+        printf("%s", (pte & PTE_X) ? "x" : "-");
+        printf("%s\n", (pte & PTE_U) ? "u" : "-");
+      }
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprint_recursive(pagetable, 0);
 }
