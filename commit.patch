@@ -1,335 +1,205 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 59f7aae..6b13c2e 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -179,6 +179,10 @@ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+ int             test_pagetable();
++void            vmprint(pagetable_t );
++void            kvmmapkern(pagetable_t, uint64, uint64, uint64, int);
++pagetable_t     kvmcreate();
++void            kvmfree(pagetable_t, uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 7b8a524..43d427a 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -97,6 +97,7 @@ int exec(char *path, char **argv) {
+   p->trapframe->sp = sp;          // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+ 
++  if(p->pid==1) vmprint(p->pagetable);
+   return argc;  // this ends up in a0, the first argument to main(argc, argv)
+ 
+ bad:
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 2046a20..26e6e8f 100644
+index 292ccb8..3d3590b 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -101,6 +101,13 @@ found:
-   p->pid = allocpid();
-   
-   // TODO: add A LOT OF init here
-+  p->created_time = ticks;
-+  p->finish_time = 0;
-+  p->running_time = 0;
-+  p->runable_time = 0;
-+  p->sleep_time = 0;
-+  p->start = ticks;
-+  p->end = 0;
- 
-   #ifdef PR
-   p->priority = 2;
-@@ -210,6 +217,7 @@ void userinit(void) {
-   p->cwd = namei("/");
- 
-   // TODO: on state change
-+  on_state_change(UNUSED,RUNNABLE,p);
-   p->state = RUNNABLE;
- 
-   release(&p->lock);
-@@ -271,6 +279,7 @@ int fork(void) {
-   pid = np->pid;
- 
-   // TODO: on state change
-+  on_state_change(UNUSED,RUNNABLE,np);
-   np->state = RUNNABLE;
- 
-   release(&np->lock);
-@@ -356,9 +365,11 @@ void exit(int status) {
-   wakeup1(original_parent);
- 
-   // TODO: on state change
--
-+  enum procstate old_state = p->state;
-   p->xstate = status;
-   p->state = ZOMBIE;
-+  on_state_change(old_state,ZOMBIE,p);
-+  p->finish_time = ticks;
- 
-   release(&original_parent->lock);
- 
-@@ -367,6 +378,7 @@ void exit(int status) {
-   panic("zombie exit");
- }
- 
-+
- // Wait for a child process to exit and return its pid.
- // Return -1 if this process has no children.
- int wait(uint64 addr) {
-@@ -461,12 +473,35 @@ void scheduler(void) {
-     }
-     #elif defined PR
-     // Priority scheduling, iterating over max_p to find process with highest priority
--
-+    struct proc *max_p = 0;    
-+    int highest_prio = 4;  
-     // First find the process with the highest priority and is RUNNABLE
--    
-+    for(p = proc; p < &proc[NPROC]; p++) {
-+      acquire(&p->lock);
-+      if(p->state == RUNNABLE) {
-+        if(p->priority < highest_prio) {
-+          if(max_p != 0) {
-+            release(&max_p->lock);
-+          }
-+          highest_prio = p->priority;
-+          max_p = p;
-+          found = 1;
-+          continue;
-+        }
-+      }
-+      release(&p->lock);
-+    }
-     
-     // If found such max_p, copy to p, and run it.
--    
-+    if (found && max_p != 0){
-+      on_state_change(max_p->state, RUNNING, max_p);
-+      max_p->state = RUNNING;
-+      c->proc = max_p;
-+      swtch(&c->context, &max_p->context);
-+
-+      c->proc = 0;
-+      release(&max_p->lock);
-+    }
-     #endif
-     // The same as Round-Robin, if no RUNNABLE process is found, we will wait for interrupt
-     if (found == 0) {
-@@ -503,7 +538,8 @@ void yield(void) {
-   acquire(&p->lock);
- 
-   // TODO: on state change
--  
-+  on_state_change(RUNNING,RUNNABLE,p);
-+
-   p->state = RUNNABLE;
-   sched();
-   release(&p->lock);
-@@ -545,6 +581,7 @@ void sleep(void *chan, struct spinlock *lk) {
+@@ -111,6 +111,8 @@ found:
+     return 0;
    }
  
-   // TODO: on state change
-+  on_state_change(RUNNING,SLEEPING,p);
++  p->kernelpgtbl = kvmcreate();
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -128,6 +130,10 @@ static void freeproc(struct proc *p) {
+   p->trapframe = 0;
+   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
++
++  if (p->kernelpgtbl) kvmfree(p->kernelpgtbl, p->sz);
++  p->kernelpgtbl = 0;
++
+   p->sz = 0;
+   p->pid = 0;
+   p->parent = 0;
+@@ -430,11 +436,16 @@ void scheduler(void) {
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++
++        w_satp(MAKE_SATP(p->kernelpgtbl));
++        sfence_vma();
++
+         swtch(&c->context, &p->context);
  
-   // Go to sleep.
-   p->chan = chan;
-@@ -571,7 +608,7 @@ void wakeup(void *chan) {
-     acquire(&p->lock);
-     if (p->state == SLEEPING && p->chan == chan) {
-       // TODO: on state change
--
-+      on_state_change(SLEEPING,RUNNABLE,p);
-       p->state = RUNNABLE;
-     }
-     release(&p->lock);
-@@ -599,7 +636,7 @@ int kill(int pid) {
-       p->killed = 1;
-       if (p->state == SLEEPING) {
-         // TODO: on state change
--
-+        on_state_change(SLEEPING,RUNNABLE,p);
-         // Wake process from sleep().
-         p->state = RUNNABLE;
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
++        kvminithart();
+ 
+         found = 1;
        }
-@@ -673,16 +710,104 @@ uint64 get_unused_procs(void) {
- 
- // get the running time, sleeping time, runnable time when the child process returns 
- int wait_sched(int *runable_time, int *running_time, int *sleep_time) {
-+  struct proc *np;
-+  int havekids, pid;
-+  struct proc *p = myproc();
-+
-+  // hold p->lock for the whole time to avoid lost
-+  // wakeups from a child's exit().
-+  acquire(&p->lock);
-+
-+  for (;;) {
-+    // Scan through table looking for exited children.
-+    havekids = 0;
-+    for (np = proc; np < &proc[NPROC]; np++) {
-+      // this code uses np->parent without holding np->lock.
-+      // acquiring the lock first would cause a deadlock,
-+      // since np might be an ancestor, and we already hold p->lock.
-+      if (np->parent == p) {
-+        // np->parent can't change between the check and the acquire()
-+        // because only the parent changes it, and we're the parent.
-+        acquire(&np->lock);
-+        havekids = 1;
-+        if (np->state == ZOMBIE) {
-+          // Found one.
-+          pid = np->pid;
-+          on_state_change(np->state,UNUSED,np);
-+
-+          if(copyout(p->pagetable, (uint64)runable_time, 
-+                    (char *)&np->runable_time, sizeof(int)) < 0 ||
-+             copyout(p->pagetable, (uint64)running_time,
-+                    (char *)&np->running_time, sizeof(int)) < 0 ||
-+             copyout(p->pagetable, (uint64)sleep_time,
-+                    (char *)&np->sleep_time, sizeof(int)) < 0) {
-+            release(&np->lock);
-+            release(&p->lock);
-+            return -1;
-+          }                 
-+          freeproc(np);
-+          release(&np->lock);
-+          release(&p->lock);
-+          return pid;
-+        }
-+        release(&np->lock);
-+      }
-+    }
-+
-+    // No point waiting if we don't have any children.
-+    if (!havekids || p->killed) {
-+      release(&p->lock);
-+      return -1;
-+    }
- 
-+    // Wait for a child to exit.
-+    sleep(p, &p->lock);  // DOC: wait-sleep
-+  }
- }
- 
- // UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE
- int on_state_change(int cur_state, int nxt_state, struct proc *p) {
--    
-+  // Get current ticks as end time for current state
-+  p->end = ticks;
-+  
-+  // Calculate duration in current state
-+  uint64 duration = p->end - p->start;
-+  
-+  // Update time spent in current state
-+  switch(cur_state) {
-+    case RUNNING:
-+      p->running_time += duration;
-+      break;
-+    case RUNNABLE:
-+      p->runable_time += duration;
-+      break;
-+    case SLEEPING:
-+      p->sleep_time += duration;
-+      break;
-+  }
-+  
-+  // Set start time for next state
-+  p->start = ticks;
-+  
-+  return 0;
- }
- 
- // set priority [0-3] to a given process [pid]
- // -1 means error, 0 means success
- int set_priority(int priority, int pid) {
-+    struct proc *p;
-+
-+    if (priority < 0 || priority > 3)
-+      return -1;
-     
-+    for (p = proc; p < &proc[NPROC]; p++){
-+      acquire(&p->lock);
-+      if (p->pid == pid){
-+        p->priority = priority;
-+        release(&p->lock);
-+        return 0;
-+      }
-+      release(&p->lock);
-+    }
-+    return -1;
- }
 diff --git a/kernel/proc.h b/kernel/proc.h
-index 5767b62..05f649d 100644
+index 9c16ea7..fba1770 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
-@@ -117,5 +117,5 @@ struct proc {
- };
- 
- // TODO: using RR for Round-Robin, using PR for Priority-Scheduling
--#define RR
--// #define PR
-\ No newline at end of file
-+// #define RR
-+#define PR
-\ No newline at end of file
-diff --git a/kernel/syscall.c b/kernel/syscall.c
-index dc65099..75ae478 100644
---- a/kernel/syscall.c
-+++ b/kernel/syscall.c
-@@ -93,6 +93,8 @@ extern uint64 sys_uptime(void);
- extern uint64 sys_rename(void);
- extern uint64 sys_trace(void);
- extern uint64 sys_sysinfo(void);
-+extern uint64 sys_wait_sched(void);
-+extern uint64 sys_set_priority(void);
- 
- static uint64 (*syscalls[])(void) = {
-     [SYS_fork] sys_fork,   [SYS_exit] sys_exit,     [SYS_wait] sys_wait,     [SYS_pipe] sys_pipe,
-@@ -101,6 +103,7 @@ static uint64 (*syscalls[])(void) = {
-     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
-     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
-     [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_trace] sys_trace,   [SYS_sysinfo] sys_sysinfo,
-+    [SYS_wait_sched] sys_wait_sched,[SYS_set_priority] sys_set_priority,
- };
- 
- char *syscallnames[] = {
-@@ -128,6 +131,8 @@ char *syscallnames[] = {
-   [SYS_rename]  "rename",
-   [SYS_trace]   "trace",
-   [SYS_sysinfo] "sysinfo",
-+  [SYS_wait_sched] "wait_sched",
-+  [SYS_set_priority] "set_priority",
- };
- 
- void syscall(void) {
-diff --git a/kernel/syscall.h b/kernel/syscall.h
-index 09c9fe5..96dcbf7 100755
---- a/kernel/syscall.h
-+++ b/kernel/syscall.h
-@@ -22,4 +22,6 @@
- #define SYS_close  21
- #define SYS_rename 22
- #define SYS_trace 23
--#define SYS_sysinfo 24
-\ No newline at end of file
-+#define SYS_sysinfo 24
-+#define SYS_wait_sched  25
-+#define SYS_set_priority 26
-\ No newline at end of file
-diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index b60e60c..6c5a904 100644
---- a/kernel/sysproc.c
-+++ b/kernel/sysproc.c
-@@ -116,11 +116,25 @@ uint64 sys_sysinfo(void) {
- 
- // 统计进程调度信息的系统调用
- uint64 sys_wait_sched(void) {
--    
-+    uint64 runnable_time;
-+    uint64 running_time;
-+    uint64 sleep_time;
+@@ -103,4 +103,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
 +
-+    if (argaddr(0,&runnable_time) < 0 ||
-+        argaddr(1,&running_time) < 0 ||
-+        argaddr(2,&sleep_time) < 0)
-+      return -1;
-+
-+    return wait_sched((int*)runnable_time, (int*)running_time, (int*)sleep_time);
++  pagetable_t kernelpgtbl;     // Kernel page table
+ };
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b794885..0287a97 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -172,6 +172,56 @@ pagetable_t uvmcreate() {
+   return pagetable;
  }
  
- 
- // 设置进程优先级的系统调用
- uint64 sys_set_priority(void) {
--    
-+    int priority, pid;
++//part 2
++void 
++kvmmapkern(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
++{
++  if (mappages(pagetable, va, sz, pa, perm) != 0) 
++    panic("kvmmap");
++}
 +
-+    if (argint(0, &priority) < 0 || argint(1, &pid) < 0)
-+      return -1;
++// proc's version of kvminit
++pagetable_t
++kvmcreate() 
++{
++  pagetable_t pagetable;
++  int i;
 +
-+    return set_priority(priority, pid);
++  pagetable = uvmcreate();
++  for(i = 1; i < 512; i++) {
++    pagetable[i] = kernel_pagetable[i];
++  }
++
++  // uart registers
++  kvmmapkern(pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
++  // virtio mmio disk interface
++  kvmmapkern(pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++  // CLINT
++  kvmmapkern(pagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++  // PLIC
++  kvmmapkern(pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++  
++  return pagetable;
++}
++
++
++void 
++kvmfree(pagetable_t kpagetale, uint64 sz) 
++{
++  pte_t pte = kpagetale[0];
++  pagetable_t level1 = (pagetable_t) PTE2PA(pte);
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = level1[i];
++    if (pte & PTE_V) {
++      uint64 level2 = PTE2PA(pte);
++      kfree((void *) level2);
++      level1[i] = 0;
++    }
++  }
++  kfree((void *) level1);
++  kfree((void *) kpagetale);
++}
++
+ // Load the user initcode into address 0 of pagetable,
+ // for the very first process.
+ // sz must be less than a page.
+@@ -378,4 +428,51 @@ int test_pagetable() {
+   uint64 gsatp = MAKE_SATP(kernel_pagetable);
+   printf("test_pagetable: %d\n", satp != gsatp);
+   return satp != gsatp;
++}
++
++void
++vmprint_recursive(pagetable_t pagetable, int level) 
++{
++  // 遍历512个页表项
++  for(int i = 0; i < 512; i++){
++    pte_t pte = pagetable[i];
++    if(pte & PTE_V) { // 只处理有效的页表项
++      // 打印缩进
++      for(int j = 0; j < level; j++){
++        printf("||   ");
++      }
++      
++      uint64 child = PTE2PA(pte);
++      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){ // 非叶节点
++        // 打印页表项信息
++        printf("||idx: %d: pa: %p, flags: ", i, child);
++        
++        // 用字符串方式打印权限标志
++        printf("%s", (pte & PTE_R) ? "r" : "-");
++        printf("%s", (pte & PTE_W) ? "w" : "-"); 
++        printf("%s", (pte & PTE_X) ? "x" : "-");
++        printf("%s\n", (pte & PTE_U) ? "u" : "-");
++        
++        // 递归处理下一级页表
++        vmprint_recursive((pagetable_t)child, level + 1);
++      } else { // 叶节点
++        // 计算虚拟地址
++        uint64 va = (uint64)i << (PXSHIFT(2-level));
++        printf("||idx: %d: va: %p -> pa: %p, flags: ", i, va, child);
++        
++        // 打印权限标志
++        printf("%s", (pte & PTE_R) ? "r" : "-");
++        printf("%s", (pte & PTE_W) ? "w" : "-");
++        printf("%s", (pte & PTE_X) ? "x" : "-");
++        printf("%s\n", (pte & PTE_U) ? "u" : "-");
++      }
++    }
++  }
++}
++
++void
++vmprint(pagetable_t pagetable)
++{
++  printf("page table %p\n", pagetable);
++  vmprint_recursive(pagetable, 0);
  }
 \ No newline at end of file
-diff --git a/times.txt b/times.txt
-new file mode 100644
-index 0000000..e440e5c
---- /dev/null
-+++ b/times.txt
-@@ -0,0 +1 @@
-+3
-\ No newline at end of file
+diff --git a/user/sh.c b/user/sh.c
+index 13c7d7c..6f1b5a8 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -54,6 +54,7 @@ void panic(char *);
+ struct cmd *parsecmd(char *);
+ 
+ // Execute cmd.  Never returns.
++__attribute__((noreturn))
+ void runcmd(struct cmd *cmd) {
+   int p[2];
+   struct backcmd *bcmd;
